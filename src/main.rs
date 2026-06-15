@@ -26,7 +26,9 @@ pub fn load_or_generate_keypair(path: &str) -> identity::Keypair {
         identity::Keypair::from_protobuf_encoding(&bytes)
             .expect("Failed to decode keypair from protobuf encoding")
     } else {
-        let keypair = identity::Keypair::generate_ed25519();
+        let mut seed = [0u8; 32];
+        let secret_key = identity::ed25519::SecretKey::try_from_bytes(&mut seed).unwrap();
+        let keypair = identity::Keypair::from(identity::ed25519::Keypair::from(secret_key));
         let bytes = keypair
             .to_protobuf_encoding()
             .expect("Failed to encode keypair to protobuf");
