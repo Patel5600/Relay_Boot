@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use libp2p::{identity, Multiaddr, swarm::SwarmEvent, PeerId};
 use futures::stream::StreamExt;
+use futures::FutureExt;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -72,11 +73,21 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     tokio::spawn(async move {
         let prune_interval_secs = 3600; // 1 hour
         let ttl_secs = 30 * 24 * 3600; // 30 days
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(prune_interval_secs));
         loop {
-            interval.tick().await;
-            if let Err(e) = storage_clone.prune_expired_records(ttl_secs) {
-                warn!("Database pruning task encountered error: {:?}", e);
+            let storage_inner = storage_clone.clone();
+            let result = std::panic::AssertUnwindSafe(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(prune_interval_secs));
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = storage_inner.prune_expired_records(ttl_secs) {
+                        warn!("Database pruning task encountered error: {:?}", e);
+                    }
+                }
+            }).catch_unwind().await;
+
+            if let Err(err) = result {
+                warn!("⚠️ Database pruning task panicked: {:?}. Restarting task in 5 seconds...", err);
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
         }
     });
@@ -95,7 +106,10 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
             config.max_connection_data = 64 * 1024 * 1024; // 64MB connection window
             config
         })
-        .with_dns()?
+        .with_dns_config(
+            libp2p::dns::ResolverConfig::cloudflare(),
+            libp2p::dns::ResolverOpts::default(),
+        )
         .with_behaviour(|keypair: &identity::Keypair| {
             let local_peer = keypair.public().to_peer_id();
 
@@ -156,153 +170,180 @@ async fn async_main() -> Result<(), Box<dyn Error>> {
     let mut peer_connections = std::collections::HashMap::<PeerId, usize>::new();
 
     // Swarm event routing loop
-    while let Some(event) = swarm.next().await {
-        match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                info!("Listening on Multiaddress: {}/p2p/{}", address, local_peer_id);
+    loop {
+        // Retrieve next event, catching any panic in the network stream polling
+        let event_opt = match std::panic::AssertUnwindSafe(swarm.next()).catch_unwind().await {
+            Ok(evt) => evt,
+            Err(e) => {
+                warn!("⚠️ Swarm event polling panicked: {:?}. Attempting to recover...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                let count = peer_connections.entry(peer_id).or_insert(0);
-                *count += 1;
-                if *count > 2 {
-                    warn!("Peer {} exceeded concurrent connection limit ({}). Dropping connection...", peer_id, *count);
-                    let _ = swarm.disconnect_peer_id(peer_id);
-                } else {
-                    info!("Connection established with peer: {} (active links: {})", peer_id, *count);
+        };
+
+        let event = match event_opt {
+            Some(evt) => evt,
+            None => {
+                info!("Swarm event stream terminated.");
+                break;
+            }
+        };
+
+        // Catch panics during individual event handling to prevent a single bad event from crashing the server
+        // We wrap the closure in AssertUnwindSafe so all borrowed local variables (swarm, peer_connections) are treated as panic-safe.
+        let handle_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+
+            match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    info!("Listening on Multiaddress: {}/p2p/{}", address, local_peer_id);
                 }
-            }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                let mut closed = false;
-                let mut remaining = 0;
-                if let Some(count) = peer_connections.get_mut(&peer_id) {
-                    if *count > 0 {
-                        *count -= 1;
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    let count = peer_connections.entry(peer_id).or_insert(0);
+                    *count += 1;
+                    if *count > 2 {
+                        warn!("Peer {} exceeded concurrent connection limit ({}). Dropping connection...", peer_id, *count);
+                        let _ = swarm.disconnect_peer_id(peer_id);
+                    } else {
+                        info!("Connection established with peer: {} (active links: {})", peer_id, *count);
                     }
-                    remaining = *count;
-                    if *count == 0 {
-                        closed = true;
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    let mut closed = false;
+                    let mut remaining = 0;
+                    if let Some(count) = peer_connections.get_mut(&peer_id) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        remaining = *count;
+                        if *count == 0 {
+                            closed = true;
+                        }
                     }
+                    if closed {
+                        peer_connections.remove(&peer_id);
+                    }
+                    info!("Connection closed with peer: {} (active links remaining: {})", peer_id, remaining);
                 }
-                if closed {
-                    peer_connections.remove(&peer_id);
-                }
-                info!("Connection closed with peer: {} (active links remaining: {})", peer_id, remaining);
-            }
-            SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
-                GlyphAnchorBehaviourEvent::RequestResponse(libp2p::request_response::Event::Message { message, .. }) => {
-                    if let libp2p::request_response::Message::Request { request, channel, .. } = message {
-                        match request {
-                            RequestEnvelope::QueryUsername { username } => {
-                                let available = storage.is_username_available(&username);
-                                let owner_pub_key = if !available {
-                                    storage.get_username_owner(&username)
-                                } else {
-                                    None
-                                };
-                                let response = ResponseEnvelope::UsernameStatus { available, owner_pub_key };
-                                let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
-                            }
-                            RequestEnvelope::RegisterUsername { username, public_key } => {
-                                match storage.register_username_first_write_wins(&username, &public_key) {
-                                    Ok(true) => {
-                                        info!("Successfully registered unique username: @{}", username);
-                                        // Broadcast key mapping to the Kademlia DHT
-                                        let key = libp2p::kad::RecordKey::new(&SledStorage::hash_username(&username));
-                                        let record = libp2p::kad::Record {
-                                            key,
-                                            value: public_key.clone(),
-                                            publisher: None,
-                                            expires: None,
-                                        };
-                                        if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, libp2p::kad::Quorum::One) {
-                                            warn!("Failed to publish record to Kademlia DHT: {:?}", e);
+                SwarmEvent::Behaviour(behaviour_event) => match behaviour_event {
+                    GlyphAnchorBehaviourEvent::RequestResponse(libp2p::request_response::Event::Message { message, .. }) => {
+                        if let libp2p::request_response::Message::Request { request, channel, .. } = message {
+                            match request {
+                                RequestEnvelope::QueryUsername { username } => {
+                                    let available = storage.is_username_available(&username);
+                                    let owner_pub_key = if !available {
+                                        storage.get_username_owner(&username)
+                                    } else {
+                                        None
+                                    };
+                                    let response = ResponseEnvelope::UsernameStatus { available, owner_pub_key };
+                                    let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+                                }
+                                RequestEnvelope::RegisterUsername { username, public_key } => {
+                                    match storage.register_username_first_write_wins(&username, &public_key) {
+                                        Ok(true) => {
+                                            info!("Successfully registered unique username: @{}", username);
+                                            // Broadcast key mapping to the Kademlia DHT
+                                            let key = libp2p::kad::RecordKey::new(&SledStorage::hash_username(&username));
+                                            let record = libp2p::kad::Record {
+                                                key,
+                                                value: public_key,
+                                                publisher: None,
+                                                expires: None,
+                                            };
+                                            if let Err(e) = swarm.behaviour_mut().kademlia.put_record(record, libp2p::kad::Quorum::One) {
+                                                warn!("Failed to publish record to Kademlia DHT: {:?}", e);
+                                            }
+                                            let response = ResponseEnvelope::RegistrationResult {
+                                                success: true,
+                                                message: "Username successfully minted".to_string(),
+                                            };
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
                                         }
-                                        let response = ResponseEnvelope::RegistrationResult {
-                                            success: true,
-                                            message: "Username successfully minted".to_string(),
-                                        };
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
-                                    }
-                                    Ok(false) => {
-                                        warn!("Registration failed: Username @{} is already taken.", username);
-                                        let response = ResponseEnvelope::RegistrationResult {
-                                            success: false,
-                                            message: "Username not available".to_string(),
-                                        };
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
-                                    }
-                                    Err(e) => {
-                                        warn!("Database error during registration of @{}: {:?}", username, e);
-                                        let response = ResponseEnvelope::RegistrationResult {
-                                            success: false,
-                                            message: format!("Database transaction error: {}", e),
-                                        };
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+                                        Ok(false) => {
+                                            warn!("Registration failed: Username @{} is already taken.", username);
+                                            let response = ResponseEnvelope::RegistrationResult {
+                                                success: false,
+                                                message: "Username not available".to_string(),
+                                            };
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+                                        }
+                                        Err(e) => {
+                                            warn!("Database error during registration of @{}: {:?}", username, e);
+                                            let response = ResponseEnvelope::RegistrationResult {
+                                                success: false,
+                                                message: format!("Database transaction error: {}", e),
+                                            };
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, response);
+                                        }
                                     }
                                 }
-                            }
-                            RequestEnvelope::Store(envelope) => {
-                                info!("Storing blind offline envelope for pubkey hash: {:?}", &envelope.target_pub_key[..std::cmp::min(8, envelope.target_pub_key.len())]);
-                                match storage.store_envelope(envelope) {
-                                    Ok(()) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Stored);
-                                    }
-                                    Err(e) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
-                                    }
-                                }
-                            }
-                            RequestEnvelope::Fetch { target_pub_key } => {
-                                info!("Fetching offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
-                                match storage.fetch_envelopes(&target_pub_key) {
-                                    Ok(envelopes) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Fetched(envelopes));
-                                    }
-                                    Err(e) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                RequestEnvelope::Store(envelope) => {
+                                    info!("Storing blind offline envelope for pubkey hash: {:?}", &envelope.target_pub_key[..std::cmp::min(8, envelope.target_pub_key.len())]);
+                                    match storage.store_envelope(envelope) {
+                                        Ok(()) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Stored);
+                                        }
+                                        Err(e) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                        }
                                     }
                                 }
-                            }
-                            RequestEnvelope::AcknowledgeDelivery { target_pub_key } => {
-                                info!("Acknowledging delivery and wiping offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
-                                match storage.wipe_envelopes(&target_pub_key) {
-                                    Ok(()) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Stored);
+                                RequestEnvelope::Fetch { target_pub_key } => {
+                                    info!("Fetching offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
+                                    match storage.fetch_envelopes(&target_pub_key) {
+                                        Ok(envelopes) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Fetched(envelopes));
+                                        }
+                                        Err(e) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                }
+                                RequestEnvelope::AcknowledgeDelivery { target_pub_key } => {
+                                    info!("Acknowledging delivery and wiping offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
+                                    match storage.wipe_envelopes(&target_pub_key) {
+                                        Ok(()) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Stored);
+                                        }
+                                        Err(e) => {
+                                            let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                GlyphAnchorBehaviourEvent::Kademlia(kad_event) => {
-                    info!("Kademlia DHT Event: {:?}", kad_event);
-                }
-                GlyphAnchorBehaviourEvent::Relay(relay_event) => {
-                    info!("Circuit Relay v2 Event: {:?}", relay_event);
-                }
-                GlyphAnchorBehaviourEvent::Identify(identify_event) => {
-                    info!("Identify Event: {:?}", identify_event);
-                    if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
-                        // Dynamically register observed addresses into Kademlia DHT routing table
-                        for addr in info.listen_addrs {
-                            swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                    GlyphAnchorBehaviourEvent::Kademlia(kad_event) => {
+                        info!("Kademlia DHT Event: {:?}", kad_event);
+                    }
+                    GlyphAnchorBehaviourEvent::Relay(relay_event) => {
+                        info!("Circuit Relay v2 Event: {:?}", relay_event);
+                    }
+                    GlyphAnchorBehaviourEvent::Identify(identify_event) => {
+                        info!("Identify Event: {:?}", identify_event);
+                        if let libp2p::identify::Event::Received { peer_id, info, .. } = identify_event {
+                            // Dynamically register observed addresses into Kademlia DHT routing table
+                            for addr in info.listen_addrs {
+                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                            }
                         }
                     }
-                }
-                GlyphAnchorBehaviourEvent::Ping(ping_event) => {
-                    if let libp2p::ping::Event { peer, result: Ok(rtt), .. } = ping_event {
-                        info!("Liveness ping with peer {} returned RTT: {:?}", peer, rtt);
+                    GlyphAnchorBehaviourEvent::Ping(ping_event) => {
+                        if let libp2p::ping::Event { peer, result: Ok(rtt), .. } = ping_event {
+                            info!("Liveness ping with peer {} returned RTT: {:?}", peer, rtt);
+                        }
                     }
-                }
-                GlyphAnchorBehaviourEvent::Dcutr(dcutr_event) => {
-                    info!("DCUtR Hole Punching Event: {:?}", dcutr_event);
+                    GlyphAnchorBehaviourEvent::Dcutr(dcutr_event) => {
+                        info!("DCUtR Hole Punching Event: {:?}", dcutr_event);
+                    }
+                    _ => {}
                 }
                 _ => {}
             }
-            _ => {}
+        }));
+
+        if let Err(panic_err) = handle_result {
+            warn!("⚠️ Critical: Panicked while processing Swarm event: {:?}", panic_err);
         }
     }
 

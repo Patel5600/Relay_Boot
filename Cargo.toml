@@ -47,3 +47,10 @@ reqwest = { version = "0.12", features = ["json"] }
 anyhow = "1.0"
 libp2p-request-response = { version = "0.27", features = ["cbor"] }
 mimalloc = { version = "0.1", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "unwind"
+strip = true

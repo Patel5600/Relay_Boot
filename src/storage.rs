@@ -37,9 +37,37 @@ impl SledStorage {
             .cache_capacity(512 * 1024 * 1024) // 512MB RAM cache layer
             .flush_every_ms(Some(50))           // Asynchronous background flush every 50ms
             .use_compression(false);            // Prioritize speed over disk compression
-        let db = config.open().expect("Failed to open Sled database");
-        let username_registry = db.open_tree("username_registry").expect("Failed to open registry tree");
-        let offline_vault = db.open_tree("offline_vault").expect("Failed to open vault tree");
+
+        let db = match config.open() {
+            Ok(db) => db,
+            Err(e) => {
+                warn!("⚠️ Failed to open Sled database at '{}': {:?}. Attempting self-healing recovery...", path, e);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let backup_path = format!("{}_corrupted_{}", path, now);
+                if let Err(rename_err) = std::fs::rename(path, &backup_path) {
+                    warn!("⚠️ Failed to rename corrupted database directory: {:?}. Attempting deletion...", rename_err);
+                    let _ = std::fs::remove_dir_all(path);
+                } else {
+                    info!("📁 Corrupted database directory renamed to '{}' for recovery.", backup_path);
+                }
+                config.open().expect("Critical: Failed to open fresh Sled database after self-healing recovery")
+            }
+        };
+
+        let username_registry = db.open_tree("username_registry").unwrap_or_else(|e| {
+            warn!("⚠️ Failed to open username_registry tree: {:?}. Clearing tree...", e);
+            let _ = db.drop_tree("username_registry");
+            db.open_tree("username_registry").expect("Critical: Failed to recreate username_registry tree")
+        });
+
+        let offline_vault = db.open_tree("offline_vault").unwrap_or_else(|e| {
+            warn!("⚠️ Failed to open offline_vault tree: {:?}. Clearing tree...", e);
+            let _ = db.drop_tree("offline_vault");
+            db.open_tree("offline_vault").expect("Critical: Failed to recreate offline_vault tree")
+        });
         
         let username_cache = Arc::new(DashMap::new());
         
