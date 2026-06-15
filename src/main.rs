@@ -1,3 +1,8 @@
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -32,13 +37,23 @@ pub fn load_or_generate_keypair(path: &str) -> identity::Keypair {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     // Setup telemetry logger
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(32)
+        .global_queue_interval(61) // Optimize thread-stealing frequency
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn Error>> {
 
     info!("🌌 Initializing Glyph Hybrid Anchor Node...");
 
@@ -70,11 +85,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
         .with_tokio()
         .with_tcp(
-            libp2p::tcp::Config::default(),
+            libp2p::tcp::Config::default().nodelay(true),
             libp2p::noise::Config::new,
             libp2p::yamux::Config::default,
         )?
-        .with_quic()
+        .with_quic_config(|mut config| {
+            config.max_concurrent_stream_limit = 1000;
+            config.max_stream_data = 32 * 1024 * 1024; // 32MB stream window
+            config.max_connection_data = 64 * 1024 * 1024; // 64MB connection window
+            config
+        })
         .with_dns()?
         .with_behaviour(|keypair: &identity::Keypair| {
             let local_peer = keypair.public().to_peer_id();

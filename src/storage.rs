@@ -32,7 +32,12 @@ pub struct SledStorage {
 
 impl SledStorage {
     pub fn new(path: &str) -> Self {
-        let db = sled::open(path).expect("Failed to open Sled database");
+        let config = sled::Config::default()
+            .path(path)
+            .cache_capacity(512 * 1024 * 1024) // 512MB RAM cache layer
+            .flush_every_ms(Some(50))           // Asynchronous background flush every 50ms
+            .use_compression(false);            // Prioritize speed over disk compression
+        let db = config.open().expect("Failed to open Sled database");
         let username_registry = db.open_tree("username_registry").expect("Failed to open registry tree");
         let offline_vault = db.open_tree("offline_vault").expect("Failed to open vault tree");
         
