@@ -1,0 +1,48 @@
+[package]
+name = "glyph-anchor-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Multi-threaded runtime for high-throughput network I/O
+tokio = { version = "1.38", features = ["full"] }
+
+# Libp2p with explicit performance features enabled
+libp2p = { version = "0.54", features = [
+    "tcp", 
+    "quic",          # High-speed UDP/QUIC layer
+    "dns",
+    "cbor",          # CBOR serialization for request-response
+    "macros",        # Procedural macros for NetworkBehaviour derive
+    "yamux", 
+    "noise", 
+    "kad", 
+    "relay", 
+    "request-response", 
+    "identify", 
+    "ping",
+    "dcutr",
+    "tokio"
+] }
+
+# Lock-Free concurrent sharded collections
+dashmap = "6.0"
+
+# Zero-copy memory architecture
+bytes = "1.6"
+
+# Ultra-fast embedded Key-Value engine for offline queueing and registry
+sled = "0.34"
+
+# Cryptographic hashing for username mapping
+sha2 = "0.10"
+
+# High-speed asynchronous telemetry and logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+anyhow = "1.0"
+libp2p-request-response = { version = "0.27", features = ["cbor"] }
