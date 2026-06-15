@@ -79,16 +79,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_behaviour(|keypair: &identity::Keypair| {
             let local_peer = keypair.public().to_peer_id();
 
-            // 1. Kademlia DHT MemoryStore behaviour
+            // 1. Kademlia DHT MemoryStore behaviour (Explicit Server Mode)
             let kad_config = libp2p::kad::Config::new(libp2p::StreamProtocol::new("/glyph/kad/1.0.0"));
             let store = libp2p::kad::store::MemoryStore::new(local_peer);
-            let kademlia = libp2p::kad::Behaviour::with_config(local_peer, store, kad_config);
+            let mut kademlia = libp2p::kad::Behaviour::with_config(local_peer, store, kad_config);
+            kademlia.set_mode(Some(libp2p::kad::Mode::Server));
 
             // 2. Circuit Relay v2 server limits
             let mut relay_config = libp2p::relay::Config::default();
-            relay_config.max_reservations = 100;
-            relay_config.max_circuits = 50;
-            relay_config.max_circuits_per_peer = 2;
+            relay_config.max_reservations = 1000;
+            relay_config.max_circuits = 1000;
+            relay_config.max_circuits_per_peer = 3;
             relay_config.reservation_duration = std::time::Duration::from_secs(120); // 2 minutes
             let relay = libp2p::relay::Behaviour::new(local_peer, relay_config);
 
@@ -233,9 +234,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                             RequestEnvelope::Fetch { target_pub_key } => {
                                 info!("Fetching offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
-                                match storage.fetch_and_wipe_envelopes(&target_pub_key) {
+                                match storage.fetch_envelopes(&target_pub_key) {
                                     Ok(envelopes) => {
                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Fetched(envelopes));
+                                    }
+                                    Err(e) => {
+                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            RequestEnvelope::AcknowledgeDelivery { target_pub_key } => {
+                                info!("Acknowledging delivery and wiping offline envelopes for pubkey: {:?}", &target_pub_key[..std::cmp::min(8, target_pub_key.len())]);
+                                match storage.wipe_envelopes(&target_pub_key) {
+                                    Ok(()) => {
+                                        let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Stored);
                                     }
                                     Err(e) => {
                                         let _ = swarm.behaviour_mut().request_response.send_response(channel, ResponseEnvelope::Error(e.to_string()));

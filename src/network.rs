@@ -14,6 +14,7 @@ pub struct OfflineEnvelope {
 pub enum RequestEnvelope {
     Store(OfflineEnvelope),
     Fetch { target_pub_key: Vec<u8> },
+    AcknowledgeDelivery { target_pub_key: Vec<u8> },
     QueryUsername { username: String },
     RegisterUsername { username: String, public_key: Vec<u8> },
 }

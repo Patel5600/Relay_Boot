@@ -158,9 +158,9 @@ impl SledStorage {
         Ok(())
     }
 
-    /// Fetches pending envelopes for a target public key and immediately wipes the store.
-    pub fn fetch_and_wipe_envelopes(&self, target_pub_key: &[u8]) -> Result<Vec<crate::network::OfflineEnvelope>, sled::Error> {
-        let result = self.offline_vault.remove(target_pub_key)?;
+    /// Fetches pending envelopes for a target public key (does NOT wipe them).
+    pub fn fetch_envelopes(&self, target_pub_key: &[u8]) -> Result<Vec<crate::network::OfflineEnvelope>, sled::Error> {
+        let result = self.offline_vault.get(target_pub_key)?;
         if let Some(bytes) = result {
             if let Ok(records) = serde_json::from_slice::<Vec<VaultRecord>>(&bytes) {
                 let envelopes = records.into_iter().map(|r| r.envelope).collect();
@@ -168,6 +168,12 @@ impl SledStorage {
             }
         }
         Ok(Vec::new())
+    }
+
+    /// Deletes (wipes) all pending envelopes for a target public key.
+    pub fn wipe_envelopes(&self, target_pub_key: &[u8]) -> Result<(), sled::Error> {
+        self.offline_vault.remove(target_pub_key)?;
+        Ok(())
     }
 
     /// Triggers push webhook gateway asynchronously using reqwest
