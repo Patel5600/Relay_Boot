@@ -2,38 +2,36 @@ use libp2p::swarm::NetworkBehaviour;
 use libp2p::{kad, relay, request_response, identify, ping, dcutr};
 use serde::{Deserialize, Serialize};
 
+// ── Wire Protocol ────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OfflineEnvelope {
-    pub target_pub_key: Vec<u8>,
-    pub payload: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub push_token: Option<String>,
+pub enum GlyphRequest {
+    Store {
+        recipient_hash: [u8; 32],
+        payload:        Vec<u8>,
+    },
+    Fetch,
+    RegisterToken {
+        recipient_hash:  [u8; 32],
+        encrypted_token: Vec<u8>,
+        expiry:          u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RequestEnvelope {
-    Store(OfflineEnvelope),
-    Fetch { target_pub_key: Vec<u8> },
-    AcknowledgeDelivery { target_pub_key: Vec<u8> },
-    QueryUsername { username: String },
-    RegisterUsername { username: String, public_key: Vec<u8> },
+pub enum GlyphResponse {
+    StoreAck         { success: bool },
+    FetchResult      { payloads: Vec<Vec<u8>> },
+    RegisterTokenAck { success: bool },
+    Error            { code: u16 },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ResponseEnvelope {
-    Stored,
-    Fetched(Vec<OfflineEnvelope>),
-    UsernameStatus { available: bool, owner_pub_key: Option<Vec<u8>> },
-    RegistrationResult { success: bool, message: String },
-    Error(String),
-}
-
+// ── NetworkBehaviour ─────────────────────────────────────────────────────
 #[derive(NetworkBehaviour)]
 pub struct GlyphAnchorBehaviour {
-    pub kademlia: kad::Behaviour<kad::store::MemoryStore>,
-    pub relay: relay::Behaviour,
-    pub request_response: request_response::cbor::Behaviour<RequestEnvelope, ResponseEnvelope>,
-    pub identify: identify::Behaviour,
-    pub ping: ping::Behaviour,
-    pub dcutr: dcutr::Behaviour,
+    pub kad:              kad::Behaviour<kad::store::MemoryStore>,
+    pub relay:            relay::Behaviour,
+    pub dcutr:            dcutr::Behaviour,
+    pub request_response: request_response::cbor::Behaviour<GlyphRequest, GlyphResponse>,
+    pub identify:         identify::Behaviour,
+    pub ping:             ping::Behaviour,
 }

@@ -1,56 +1,78 @@
 [package]
-name = "glyph-anchor-server"
-version = "0.1.0"
+name    = "glyph-anchor-server"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-# Multi-threaded runtime for high-throughput network I/O
-tokio = { version = "1.38", features = ["full"] }
+# ── Async Runtime ────────────────────────────────────────────────────────
+tokio                = { version = "1.38", features = ["full"] }
 
-# Libp2p with explicit performance features enabled
-libp2p = { version = "0.54", features = [
-    "tcp", 
-    "quic",          # High-speed UDP/QUIC layer
-    "dns",
-    "cbor",          # CBOR serialization for request-response
-    "macros",        # Procedural macros for NetworkBehaviour derive
-    "yamux", 
-    "noise", 
-    "kad", 
-    "relay", 
-    "request-response", 
-    "identify", 
-    "ping",
-    "dcutr",
-    "tokio"
-] }
+# ── Networking ───────────────────────────────────────────────────────────
+libp2p               = { version = "0.54", features = [
+    "tcp",               # TCP transport
+    "quic",              # QUIC/UDP transport (primary)
+    "dns",               # Multiaddr /dns4/ resolution
+    "yamux",             # Stream multiplexer
+    "noise",             # Noise XX security
+    "kad",               # Kademlia DHT
+    "relay",             # Circuit Relay v2 server
+    "dcutr",             # Direct Connection Upgrade through Relay
+    "request-response",  # Store-and-Forward protocol
+    "cbor",              # CBOR codec for request-response
+    "identify",          # Peer identity exchange
+    "ping",              # Connection liveness
+    "macros",            # #[derive(NetworkBehaviour)]
+    "tokio",             # Tokio runtime integration
+]}
 
-# Lock-Free concurrent sharded collections
-dashmap = "6.0"
+# ── Concurrency / Collections ────────────────────────────────────────────
+dashmap              = { version = "6.0", features = ["serde"] }
+bytes                = "1.6"
 
-# Zero-copy memory architecture
-bytes = "1.6"
+# ── Storage ──────────────────────────────────────────────────────────────
+redb                 = "2.1"         # Replaces sled — ACID, WAL, pure Rust, maintained
 
-# Ultra-fast embedded Key-Value engine for offline queueing and registry
-sled = "0.34"
+# ── Serialization ────────────────────────────────────────────────────────
+serde                = { version = "1.0", features = ["derive"] }
+ciborium             = "0.2"         # CBOR — wire protocol serialization
+serde_json           = "1.0"         # JSON — config files and webhook payloads only
+serde_bytes          = "0.11"        # Efficient byte array serialization
 
-# Cryptographic hashing for username mapping
-sha2 = "0.10"
+# ── Cryptography ─────────────────────────────────────────────────────────
+sha2                 = "0.10"        # SHA256 for vault keys and token blinding
+hmac                 = "0.12"        # HMAC-SHA256 for webhook signing
+zeroize              = "1.7"         # Zero sensitive memory after use
 
-# High-speed asynchronous telemetry and logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-futures = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
-anyhow = "1.0"
-libp2p-request-response = { version = "0.27", features = ["cbor"] }
-mimalloc = { version = "0.1", default-features = false }
+# ── Logging ──────────────────────────────────────────────────────────────
+tracing              = "0.1"
+tracing-subscriber   = { version = "0.3", features = ["env-filter", "json"] }
+
+# ── HTTP (Webhooks only) ─────────────────────────────────────────────────
+reqwest              = { version = "0.12", features = ["json"] }
+
+# ── Error Handling ───────────────────────────────────────────────────────
+anyhow               = "1.0"
+
+# ── Async Utilities ──────────────────────────────────────────────────────
+futures              = "0.3"
+
+# ── Performance ──────────────────────────────────────────────────────────
+mimalloc             = { version = "0.1", default-features = false }
+
+# ── Random ───────────────────────────────────────────────────────────────
+rand                 = "0.8"         # For pruner jitter
+
+# ── Utilities ────────────────────────────────────────────────────────────
+base64               = "0.22"
+hex                  = "0.4"
 
 [profile.release]
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "unwind"
-strip = true
+opt-level        = 3
+lto              = true
+codegen-units    = 1
+panic            = "abort"       # CORRECTED from "unwind"
+strip            = true
+overflow-checks  = true
+
+[profile.dev]
+overflow-checks  = true
